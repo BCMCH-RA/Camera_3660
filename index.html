@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>XIAO ESP32S3 Sense · Cam</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+     background:#0f1115;color:#e8eaf0;min-height:100vh;display:flex;flex-direction:column}
+header{display:flex;align-items:center;justify-content:space-between;gap:10px;
+       padding:10px 14px;background:#171a21;border-bottom:1px solid #262b36}
+h1{font-size:1rem;margin:0;font-weight:600;white-space:nowrap}
+#connbox{display:flex;align-items:center;gap:6px;font-size:.78rem;color:#9aa3b5}
+#dot{width:9px;height:9px;border-radius:50%;background:#f0b429}
+#dot.ok{background:#31c48d}#dot.bad{background:#e74c3c}
+main{flex:1;display:flex;flex-direction:column;align-items:center;gap:12px;padding:14px}
+#frame{position:relative;width:min(100%,640px);aspect-ratio:4/3;max-height:68vh;
+       background:#000;border:1px solid #262b36;border-radius:10px;overflow:hidden}
+#frame.empty::after{content:'waiting for the first photo...';position:absolute;inset:0;
+       display:flex;align-items:center;justify-content:center;color:#8b94a6;font-size:.9rem}
+#photo{display:block;width:100%;height:100%;object-fit:contain}
+#controls{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+button{background:#2b3444;color:#e8eaf0;border:1px solid #3a4356;border-radius:8px;
+       padding:9px 14px;font-size:.9rem;cursor:pointer}
+button:active{transform:scale(.97)}
+#btnSnap{background:#3b6fd4;border-color:#3b6fd4}
+.hint{font-size:.75rem;color:#8b94a6;margin:0;text-align:center}
+footer{padding:8px 12px;background:#171a21;border-top:1px solid #262b36;font-size:.75rem;
+       color:#8b94a6;display:flex;gap:14px;flex-wrap:wrap;justify-content:center}
+footer b{color:#e8eaf0;font-weight:600}
+</style>
+</head>
+<body>
+<header>
+  <h1>📸 XIAO ESP32S3 Sense · OV3660</h1>
+  <div id="connbox"><span id="dot"></span><span id="conn">connecting…</span></div>
+</header>
+<main>
+  <div id="frame" class="empty"><img id="photo" alt="photo"></div>
+  <div id="controls">
+    <button id="btnSnap">⚡ Capture now</button>
+    <button id="btnSave">💾 Save photo</button>
+    <button id="btnLive">▶ Live view</button>
+  </div>
+  <p class="hint">The ESP32 takes a photo every 10 s — this page updates automatically.</p>
+</main>
+<footer>
+  <span>photo <b id="fFrame">–</b></span>
+  <span>size <b id="fSize">–</b></span>
+  <span>next in <b id="fNext">–</b></span>
+  <span>uptime <b id="fUp">–</b></span>
+  <span>free heap <b id="fHeap">–</b></span>
+</footer>
+<script>
+"use strict";
+const $=i=>document.getElementById(i);
+const photo=$("photo"),frame=$("frame"),dot=$("dot"),conn=$("conn");
+let lastFrame=-1,lastFrameAt=0,live=false,busy=false,interval=10000;
+
+const fmtB=b=>b>=1048576?(b/1048576).toFixed(1)+" MB":(b/1024).toFixed(0)+" KB";
+const fmtUp=ms=>{const s=Math.floor(ms/1000),
+  h=String(Math.floor(s/3600)).padStart(2,"0"),
+  m=String(Math.floor(s%3600/60)).padStart(2,"0");
+  return h+":"+m+":"+String(s%60).padStart(2,"0")};
+
+async function poll(){
+  if(live||busy)return;
+  busy=true;
+  try{
+    const r=await fetch("/status",{cache:"no-store"});
+    const s=await r.json();
+    interval=s.interval||10000;
+    dot.className="ok";conn.textContent="connected";
+    if(s.frames!==lastFrame&&s.size>0){
+      lastFrame=s.frames;lastFrameAt=Date.now();
+      photo.src="/capture?f="+s.frames;          // unique URL = no caching
+      frame.classList.remove("empty");
+      $("fFrame").textContent="#"+s.frames+" · "+s.width+"×"+s.height;
+      $("fSize").textContent=fmtB(s.size);
+    }
+    $("fUp").textContent=fmtUp(s.uptime);
+    $("fHeap").textContent=fmtB(s.heap);
+  }catch(e){
+    dot.className="bad";conn.textContent="reconnecting…";
+  }finally{busy=false}
+}
+setInterval(poll,1000);poll();
+
+setInterval(()=>{
+  $("fNext").textContent=live?"live":
+    lastFrameAt?Math.max(0,Math.ceil((lastFrameAt+interval-Date.now())/1000))+" s":"–";
+},250);
+
+photo.onerror=()=>{
+  if(live){live=false;$("btnLive").textContent="▶ Live view";conn.textContent="reconnecting…"}
+  frame.classList.add("empty");
+};
+
+ $("btnSnap").onclick=async()=>{try{await fetch("/snap",{cache:"no-store"})}catch(e){}};
+
+ $("btnSave").onclick=async()=>{
+  try{
+    const r=await fetch("/capture?f="+(lastFrame<0?0:lastFrame)+"&t="+Date.now(),{cache:"no-store"});
+    if(!r.ok)throw 0;
+    const blob=await r.blob(),d=new Date(),p=n=>String(n).padStart(2,"0");
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);
+    a.download="xiao-cam_"+d.getFullYear()+"-"+p(d.getMonth()+1)+"-"+p(d.getDate())+
+               "_"+p(d.getHours())+"-"+p(d.getMinutes())+"-"+p(d.getSeconds())+".jpg";
+    document.body.appendChild(a);a.click();a.remove();
+    setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+  }catch(e){alert("Download failed")}
+};
+
+ $("btnLive").onclick=()=>{
+  live=!live;
+  if(live){
+    photo.src="/stream";frame.classList.remove("empty");
+    $("btnLive").textContent="⏹ Stop live";dot.className="ok";conn.textContent="live";
+  }else{
+    $("btnLive").textContent="▶ Live view";lastFrame=-1;poll();
+  }
+};
+</script>
+</body>
+</html>
