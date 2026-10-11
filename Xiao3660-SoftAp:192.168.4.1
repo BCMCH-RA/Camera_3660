@@ -1,0 +1,665 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ESP_I2S.h>
+#include "esp_camera.h"
+#include "esp_heap_caps.h"
+
+#include <memory>
+#include <algorithm>
+#include <cstring>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
+
+// ---------- Settings ----------
+
+const char *AP_SSID = "XIAO-Sense";
+const char *AP_PASSWORD = "sense12345";  // At least 8 characters
+
+constexpr uint32_t SAMPLE_RATE = 16000;
+constexpr uint32_t AUDIO_BYTES_PER_SECOND = SAMPLE_RATE * 2;
+constexpr uint32_t MAX_RECORD_SECONDS = 30;
+constexpr uint32_t FRAME_INTERVAL_MS = 125;  // Target <= 8 FPS
+
+AsyncWebServer server(80);
+I2SClass microphone;
+
+SemaphoreHandle_t dataMutex;
+QueueHandle_t recordingQueue;
+
+// Immutable after publication to the web server.
+// Each HTTP response holds a shared_ptr so its bytes remain valid
+// until transmission finishes or the client disconnects.
+struct Blob {
+  uint8_t *data;
+  size_t size;
+
+  explicit Blob(size_t n) : data(nullptr), size(n) {
+    data = static_cast<uint8_t *>(
+      heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+    );
+  }
+
+  ~Blob() {
+    free(data);
+  }
+
+  Blob(const Blob &) = delete;
+  Blob &operator=(const Blob &) = delete;
+};
+
+using BlobPtr = std::shared_ptr<Blob>;
+
+BlobPtr latestFrame;
+BlobPtr latestRecording;
+
+uint32_t frameTime = 0;
+bool recordingBusy = false;
+uint32_t recordedBytes = 0;
+uint32_t requestedSeconds = 0;
+const char *recordingError = "";
+
+// Explicit prototype keeps Arduino's prototype generator happy.
+void sendBlob(
+  AsyncWebServerRequest *request,
+  BlobPtr blob,
+  const char *mime,
+  const char *filename
+);
+
+// ---------- Browser page ----------
+
+const char PAGE[] PROGMEM = R"HTML(
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XIAO Sense</title>
+<style>
+  body {
+    margin: 0; background: #101827; color: #edf2f7;
+    font: 16px system-ui, sans-serif;
+  }
+  main { max-width: 760px; margin: auto; padding: 22px; }
+  section {
+    background: #1c293c; border-radius: 16px;
+    padding: 18px; margin-bottom: 18px;
+  }
+  h1 { margin-bottom: 6px; }
+  h2 { font-size: 20px; margin-top: 0; }
+  p { color: #c3cede; line-height: 1.5; }
+  img {
+    display: block; width: 100%; aspect-ratio: 4/3;
+    object-fit: contain; background: #080d16;
+    border-radius: 10px;
+  }
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+  button, select, a.button {
+    border: 0; border-radius: 9px; padding: 12px 16px;
+    font: inherit; background: #45d0b1; color: #08281f;
+    cursor: pointer; text-decoration: none;
+  }
+  select { background: #edf2f7; color: #172033; }
+  button:disabled { opacity: .45; cursor: wait; }
+  [hidden] { display: none !important; }
+  .status { min-height: 24px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>XIAO Sense</h1>
+  <p>Local camera and microphone. Files download to this device.</p>
+
+  <section>
+    <h2>Camera</h2>
+    <img id="camera" alt="Live camera view">
+    <div class="controls">
+      <button id="live">Pause live view</button>
+      <button id="photo">Take photo</button>
+    </div>
+    <p id="cameraStatus" class="status">Connecting...</p>
+  </section>
+
+  <section>
+    <h2>Microphone</h2>
+    <p>16 kHz mono WAV. Recording stops after the selected duration.</p>
+    <div class="controls">
+      <select id="duration" aria-label="Recording duration">
+        <option value="5">5 seconds</option>
+        <option value="10" selected>10 seconds</option>
+        <option value="20">20 seconds</option>
+        <option value="30">30 seconds</option>
+      </select>
+      <button id="record" disabled>Record audio</button>
+      <a id="audioDownload" class="button"
+         href="/audio.wav" download="recording.wav" hidden>
+        Download WAV
+      </a>
+    </div>
+    <p id="audioStatus" class="status">Connecting...</p>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let live = true;
+let imageURL = null;
+let commandPending = false;
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function api(url, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch(url, {
+      ...options, cache: "no-store", signal: controller.signal
+    });
+    if (!response.ok) throw new Error(await response.text());
+    // Consume body before clearing the timeout.
+    return await response.blob();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function liveLoop() {
+  while (true) {
+    if (live && !document.hidden) {
+      try {
+        const blob = await api("/frame");
+        const nextURL = URL.createObjectURL(blob);
+        const oldURL = imageURL;
+        $("camera").src = nextURL;
+        imageURL = nextURL;
+        try { await $("camera").decode(); } catch (_) {}
+        if (oldURL) URL.revokeObjectURL(oldURL);
+        $("cameraStatus").textContent = live ? "Live" : "Paused";
+      } catch (error) {
+        $("cameraStatus").textContent = "Camera: " + error.message;
+        await sleep(800);
+      }
+    }
+    await sleep(125); // Only one frame request is in flight.
+  }
+}
+
+$("live").onclick = () => {
+  live = !live;
+  $("live").textContent = live ? "Pause live view" : "Resume live view";
+  $("cameraStatus").textContent = live ? "Connecting..." : "Paused";
+};
+
+$("photo").onclick = async () => {
+  $("photo").disabled = true;
+  try {
+    const blob = await api("/photo.jpg");
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "xiao-" + Date.now() + ".jpg";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  } catch (error) {
+    $("cameraStatus").textContent = error.message;
+  } finally {
+    $("photo").disabled = false;
+  }
+};
+
+$("record").onclick = async () => {
+  commandPending = true;
+  $("record").disabled = true;
+  $("audioDownload").hidden = true;
+  try {
+    await api("/record?seconds=" + $("duration").value, {method: "POST"});
+    $("audioStatus").textContent = "Recording...";
+  } catch (error) {
+    $("audioStatus").textContent = error.message;
+  } finally {
+    commandPending = false;
+  }
+};
+
+async function statusLoop() {
+  while (true) {
+    try {
+      const blob = await api("/status");
+      const state = JSON.parse(await blob.text());
+
+      if (!commandPending) {
+        $("record").disabled = state.busy;
+        $("duration").disabled = state.busy;
+        $("audioDownload").hidden = state.busy || !state.ready;
+
+        $("audioStatus").textContent = state.busy
+          ? "Recording: " + state.seconds.toFixed(1) +
+            " / " + state.target + " seconds"
+          : state.error
+            ? state.error
+            : state.ready
+              ? "Recording ready. Download before recording again."
+              : "Ready";
+      }
+    } catch (_) {
+      $("record").disabled = true;
+      $("audioStatus").textContent = "Connection lost. Reconnect to XIAO-Sense.";
+    }
+    await sleep(500);
+  }
+}
+
+liveLoop();
+statusLoop();
+</script>
+</body>
+</html>
+)HTML";
+
+// ---------- Helpers ----------
+
+void fatal(const char *message) {
+  Serial.println(message);
+  while (true) delay(1000);
+}
+
+void writeLE16(uint8_t *p, uint16_t value) {
+  p[0] = value;
+  p[1] = value >> 8;
+}
+
+void writeLE32(uint8_t *p, uint32_t value) {
+  p[0] = value;
+  p[1] = value >> 8;
+  p[2] = value >> 16;
+  p[3] = value >> 24;
+}
+
+void makeWavHeader(uint8_t *p, uint32_t pcmBytes) {
+  memset(p, 0, 44);
+  memcpy(p, "RIFF", 4);
+  writeLE32(p + 4, pcmBytes + 36);
+  memcpy(p + 8, "WAVEfmt ", 8);
+  writeLE32(p + 16, 16);
+  writeLE16(p + 20, 1);  // PCM
+  writeLE16(p + 22, 1);  // Mono
+  writeLE32(p + 24, SAMPLE_RATE);
+  writeLE32(p + 28, AUDIO_BYTES_PER_SECOND);
+  writeLE16(p + 32, 2);  // Bytes per sample
+  writeLE16(p + 34, 16); // Bits per sample
+  memcpy(p + 36, "data", 4);
+  writeLE32(p + 40, pcmBytes);
+}
+
+void sendBlob(
+  AsyncWebServerRequest *request,
+  BlobPtr blob,
+  const char *mime,
+  const char *filename
+) {
+  if (!blob || !blob->data) {
+    request->send(503, "text/plain", "No data available yet");
+    return;
+  }
+
+  auto *response = request->beginResponse(
+    mime, blob->size,
+    [blob](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+      if (index >= blob->size) return 0;
+      size_t n = std::min(maxLen, blob->size - index);
+      memcpy(buffer, blob->data + index, n);
+      return n;
+    }
+  );
+
+  response->addHeader("Cache-Control", "no-store");
+
+  if (filename) {
+    response->addHeader(
+      "Content-Disposition",
+      String("attachment; filename=\"") + filename + "\""
+    );
+  }
+
+  request->send(response);
+}
+
+// ---------- Camera ----------
+
+bool startCamera() {
+  camera_config_t c = {};
+
+  // XIAO ESP32S3 Sense camera connector.
+  c.pin_pwdn = -1;
+  c.pin_reset = -1;
+  c.pin_xclk = 10;
+  c.pin_sccb_sda = 40;
+  c.pin_sccb_scl = 39;
+
+  c.pin_d0 = 15;
+  c.pin_d1 = 17;
+  c.pin_d2 = 18;
+  c.pin_d3 = 16;
+  c.pin_d4 = 14;
+  c.pin_d5 = 12;
+  c.pin_d6 = 11;
+  c.pin_d7 = 48;
+
+  c.pin_vsync = 38;
+  c.pin_href = 47;
+  c.pin_pclk = 13;
+
+  c.xclk_freq_hz = 10000000;       // 10 MHz
+  c.ledc_timer = LEDC_TIMER_0;
+  c.ledc_channel = LEDC_CHANNEL_0;
+  c.pixel_format = PIXFORMAT_JPEG;
+  c.frame_size = FRAMESIZE_VGA;    // 640 x 480
+  c.jpeg_quality = 20;            // More compression
+  c.fb_count = 1;
+  c.fb_location = CAMERA_FB_IN_PSRAM;
+  c.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+
+  esp_err_t result = esp_camera_init(&c);
+  if (result != ESP_OK) {
+    Serial.printf("Camera initialization failed: 0x%x\n", result);
+    return false;
+  }
+  return true;
+}
+
+void cameraTask(void *) {
+  while (true) {
+    camera_fb_t *fb = esp_camera_fb_get();
+
+    if (fb) {
+      if (fb->format == PIXFORMAT_JPEG) {
+        auto frame = std::make_shared<Blob>(fb->len);
+
+        if (frame->data) {
+          memcpy(frame->data, fb->buf, fb->len);
+
+          xSemaphoreTake(dataMutex, portMAX_DELAY);
+          latestFrame = frame;
+          frameTime = millis();
+          xSemaphoreGive(dataMutex);
+        }
+      }
+
+      // Return the driver's buffer immediately.
+      // HTTP responses use the independent copy above.
+      esp_camera_fb_return(fb);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(FRAME_INTERVAL_MS));
+  }
+}
+
+void serveFrame(AsyncWebServerRequest *request, bool download) {
+  BlobPtr frame;
+  uint32_t age;
+
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  frame = latestFrame;
+  age = millis() - frameTime;
+  xSemaphoreGive(dataMutex);
+
+  if (!frame || age > 3000) {
+    request->send(503, "text/plain", "Camera frame unavailable");
+    return;
+  }
+
+  sendBlob(
+    request, frame, "image/jpeg",
+    download ? "photo.jpg" : nullptr
+  );
+}
+
+// ---------- Audio worker ----------
+
+void audioTask(void *) {
+  uint32_t seconds;
+
+  while (true) {
+    if (xQueueReceive(recordingQueue, &seconds, portMAX_DELAY) != pdTRUE) {
+      continue;
+    }
+
+    const size_t pcmSize = seconds * AUDIO_BYTES_PER_SECOND;
+    auto wav = std::make_shared<Blob>(44 + pcmSize);
+    const char *error = "";
+    size_t offset = 0;
+
+    if (!wav->data) {
+      error = "Not enough PSRAM for recording";
+    } else {
+      microphone.setPinsPdmRx(42, 41); // CLK, DATA
+
+      if (!microphone.begin(
+        I2S_MODE_PDM_RX,
+        SAMPLE_RATE,
+        I2S_DATA_BIT_WIDTH_16BIT,
+        I2S_SLOT_MODE_MONO
+      )) {
+        error = "Microphone initialization failed";
+      } else {
+        // A finite driver timeout prevents a failed microphone from
+        // leaving the recording permanently busy.
+        while (offset < pcmSize) {
+          size_t received = 0;
+          size_t wanted = std::min(size_t(1024), pcmSize - offset);
+
+          esp_err_t result = i2s_channel_read(
+            microphone.rxChan(),
+            wav->data + 44 + offset,
+            wanted,
+            &received,
+            1000
+          );
+
+          if (result != ESP_OK || received == 0 || (received & 1)) {
+            error = "Microphone read failed; try recording again";
+            break;
+          }
+
+          offset += received;
+
+          xSemaphoreTake(dataMutex, portMAX_DELAY);
+          recordedBytes = offset;
+          xSemaphoreGive(dataMutex);
+        }
+      }
+
+      microphone.end();
+    }
+
+    if (error[0] == '\0') {
+      makeWavHeader(wav->data, pcmSize);
+    }
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (error[0] == '\0') {
+      latestRecording = wav;
+    }
+    recordingError = error;
+    recordingBusy = false;
+    xSemaphoreGive(dataMutex);
+  }
+}
+
+// ---------- HTTP routes ----------
+
+void setupRoutes() {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *r) {
+    r->send_P(200, "text/html", PAGE);
+  });
+
+  server.on("/frame", HTTP_GET, [](AsyncWebServerRequest *r) {
+    serveFrame(r, false);
+  });
+
+  server.on("/photo.jpg", HTTP_GET, [](AsyncWebServerRequest *r) {
+    serveFrame(r, true);
+  });
+
+  server.on("/record", HTTP_POST, [](AsyncWebServerRequest *r) {
+    if (!r->hasParam("seconds")) {
+      r->send(400, "text/plain", "Missing recording duration");
+      return;
+    }
+
+    String value = r->getParam("seconds")->value();
+    if (value != "5" && value != "10" &&
+        value != "20" && value != "30") {
+      r->send(400, "text/plain", "Choose 5, 10, 20, or 30 seconds");
+      return;
+    }
+
+    uint32_t seconds = value.toInt();
+    if (seconds > MAX_RECORD_SECONDS) {
+      r->send(400, "text/plain", "Duration exceeds recording limit");
+      return;
+    }
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+
+    if (recordingBusy) {
+      xSemaphoreGive(dataMutex);
+      r->send(409, "text/plain", "A recording is already running");
+      return;
+    }
+
+    recordingBusy = true;
+    recordedBytes = 0;
+    requestedSeconds = seconds;
+    recordingError = "";
+    latestRecording.reset();
+    xSemaphoreGive(dataMutex);
+
+    if (xQueueSend(recordingQueue, &seconds, 0) != pdTRUE) {
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+      recordingBusy = false;
+      recordingError = "Could not schedule recording";
+      xSemaphoreGive(dataMutex);
+
+      r->send(503, "text/plain", "Could not schedule recording");
+      return;
+    }
+
+    r->send(202, "text/plain", "Recording started");
+  });
+
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *r) {
+    bool busy, ready;
+    uint32_t bytes, target;
+    const char *error;
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    busy = recordingBusy;
+    ready = bool(latestRecording);
+    bytes = recordedBytes;
+    target = requestedSeconds;
+    error = recordingError;
+    xSemaphoreGive(dataMutex);
+
+    char json[256];
+    snprintf(
+      json, sizeof(json),
+      "{\"busy\":%s,\"ready\":%s,\"seconds\":%.2f,"
+      "\"target\":%lu,\"error\":\"%s\"}",
+      busy ? "true" : "false",
+      ready ? "true" : "false",
+      double(bytes) / AUDIO_BYTES_PER_SECOND,
+      static_cast<unsigned long>(target),
+      error
+    );
+
+    auto *response = r->beginResponse(200, "application/json", json);
+    response->addHeader("Cache-Control", "no-store");
+    r->send(response);
+  });
+
+  server.on("/audio.wav", HTTP_GET, [](AsyncWebServerRequest *r) {
+    BlobPtr wav;
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (!recordingBusy) wav = latestRecording;
+    xSemaphoreGive(dataMutex);
+
+    if (!wav) {
+      r->send(409, "text/plain", "No finished recording available");
+      return;
+    }
+
+    sendBlob(r, wav, "audio/wav", "recording.wav");
+  });
+
+  server.onNotFound([](AsyncWebServerRequest *r) {
+    r->send(404, "text/plain", "Not found");
+  });
+}
+
+// ---------- Startup ----------
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  if (!psramFound()) {
+    fatal("PSRAM not found. Enable OPI PSRAM in board settings.");
+  }
+
+  dataMutex = xSemaphoreCreateMutex();
+  recordingQueue = xQueueCreate(1, sizeof(uint32_t));
+
+  if (!dataMutex || !recordingQueue) {
+    fatal("Failed to create synchronization objects.");
+  }
+
+  if (!startCamera()) {
+    fatal("Check the camera ribbon cable and Sense expansion board.");
+  }
+
+  WiFi.mode(WIFI_AP);
+
+  IPAddress ip(192, 168, 4, 1);
+  IPAddress mask(255, 255, 255, 0);
+
+  if (!WiFi.softAPConfig(ip, ip, mask)) {
+    fatal("Failed to configure access point.");
+  }
+
+  // Channel 1, visible SSID, one connected Wi-Fi device.
+  if (!WiFi.softAP(AP_SSID, AP_PASSWORD, 1, false, 1)) {
+    fatal("Failed to start access point.");
+  }
+
+  if (xTaskCreate(
+    cameraTask, "camera", 6144, nullptr, 1, nullptr
+  ) != pdPASS) {
+    fatal("Failed to create camera task.");
+  }
+
+  if (xTaskCreate(
+    audioTask, "audio", 6144, nullptr, 2, nullptr
+  ) != pdPASS) {
+    fatal("Failed to create audio task.");
+  }
+
+  setupRoutes();
+  server.begin();
+
+  Serial.printf("\nWi-Fi: %s\nPassword: %s\n", AP_SSID, AP_PASSWORD);
+  Serial.print("Open http://");
+  Serial.println(WiFi.softAPIP());
+}
+
+void loop() {
+  delay(1000); // Web server and capture workers run independently.
+}
